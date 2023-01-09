@@ -1,5 +1,5 @@
 
-NAME = plujain-ramp
+NAME = plujain-multip
 
 # installation path
 INSTALL_PATH = /usr/local/lib/lv2
@@ -10,10 +10,10 @@ CXX ?= g++
 
 # flags
 CXXFLAGS += -I. -c -ffast-math -fPIC -DPIC -Wall -fvisibility=hidden
-LDFLAGS += -shared -lm
+LDFLAGS += -shared -lm 
 
 # libs
-LIBS =
+LIBS = -llo -lpthread
 
 # remove command
 RM = rm -f
@@ -23,7 +23,7 @@ SRC = $(wildcard src/*.cpp)
 OBJ = $(SRC:.cpp=.o)
 
 # plugin name
-PLUGIN = ramp.so
+PLUGIN = multip.so
 
 $(PLUGIN): $(OBJ)
 	$(CXX) $(LDFLAGS) $(OBJ) -o $(PLUGIN) $(LIBS)

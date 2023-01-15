@@ -31,7 +31,8 @@ enum {
     STOP_TIME,
     AVERAGE_TEMPO,
     N_TAPS,
-    VALSE,
+    RESTART_CYCLE,
+    MOVING_TEMPO,
     PLUGIN_PORT_COUNT};
 
 enum {BYPASS, FIRST_WAITING_PERIOD, WAITING_SIGNAL, FIRST_PERIOD, EFFECT, OUTING};
@@ -97,10 +98,12 @@ public:
     float *stop_time;
     float *average_tempo;
     float *n_taps;
-    float *valse;
+    float *restart_cycle;
+    float *moving_tempo;
 
     
     double samplerate;
+    uint32_t pre_mute_frames;
     
     float velocity_factor;
     uint64_t frames_since_last_order_kick;
@@ -108,7 +111,7 @@ public:
     bool muting;
     bool playing;
     uint8_t n_taps_done;
-    uint64_t frames_since_first_tap;
+    float current_tempo;
 
     uint8_t playing_column;
     uint8_t playing_velo_row;
@@ -208,11 +211,12 @@ LV2_Handle Multip::instantiate(const LV2_Descriptor* descriptor, double samplera
     
     plugin->samplerate = samplerate;
 
+    plugin->pre_mute_frames = 0.050 * samplerate;
     plugin->velocity_factor = 1.0;
     plugin->frames_since_last_kick = 0;
+    plugin->frames_since_last_order_kick = 0;
     plugin->muting = false;
     plugin->playing = false;
-    plugin->frames_since_first_tap = 0;
 
     plugin->playing_column = 0;
     plugin->playing_velo_row = 2;
@@ -287,8 +291,11 @@ void Multip::connect_port(LV2_Handle instance, uint32_t port, void *data)
         case N_TAPS:
             plugin->n_taps = (float*) data;
             break;
-        case VALSE:
-            plugin->valse = (float*) data;
+        case RESTART_CYCLE:
+            plugin->restart_cycle = (float*) data;
+            break;
+        case MOVING_TEMPO:
+            plugin->moving_tempo = (float*) data;
             break;
     }
         
@@ -307,6 +314,9 @@ void Multip::run(LV2_Handle instance, uint32_t n_samples)
     lv2_atom_forge_set_buffer (&plugin->forge, (uint8_t*)plugin->midi_out, capacity);
     lv2_atom_forge_sequence_head (&plugin->forge, &plugin->frame, 0);
 
+    uint32_t kick_sample = 0;
+    uint32_t order_kick_sample = 0;
+
     /* process control kick events 
         note 36 on the last channel */
     LV2_Atom_Event* ev = lv2_atom_sequence_begin (&(plugin->midi_in)->body);
@@ -315,7 +325,6 @@ void Multip::run(LV2_Handle instance, uint32_t n_samples)
                 and (((const uint8_t*)(ev+1))[0] == 0x9F
                      or ((const uint8_t*)(ev+1))[0] == 0x8F)) {
             if (((const uint8_t*)(ev+1))[0] == 0x9F){
-                printf("un kick on\n");
                 lo::Address a ("localhost", "2354");
                 if (not plugin->playing){
 
@@ -325,6 +334,7 @@ void Multip::run(LV2_Handle instance, uint32_t n_samples)
                         case 0:
                             break;
                         case 1:
+                            plugin->current_tempo = *plugin->average_tempo;
                             a.send("/bpm", "f", *plugin->average_tempo);
                             plugin->playing_column = 0;
                             a.send("/sequence", "si", "off", plugin->playing_column);
@@ -334,55 +344,84 @@ void Multip::run(LV2_Handle instance, uint32_t n_samples)
                             plugin->playing = true;
                             break;
                         default:
-                            if (plugin->n_taps_done == 0){
-                                plugin->frames_since_first_tap = 0;
-                            }
-
                             plugin->n_taps_done += 1;
 
-                            printf("burllu %d\n", plugin->n_taps_done);
+                            float bpm = (60.0
+                                         / (plugin->frames_since_last_order_kick
+                                            / plugin->samplerate));
+                            bool valid_bpm = true;
 
-                            if (plugin->n_taps_done >= n_taps){
-                                float bpm = (60
-                                             / (plugin->frames_since_last_order_kick
-                                                / plugin->samplerate));
-                                bool valid_bpm = true;
+                            if (bpm < *plugin->average_tempo / 5.0){
+                                valid_bpm = false;
+                            } else if (bpm < *plugin->average_tempo / 3.5){
+                                bpm *= 4;
+                            } else if (bpm < *plugin->average_tempo / 2.5){
+                                bpm *= 3;
+                            } else if (bpm < *plugin->average_tempo / 1.75){
+                                bpm *= 2;
+                            } else if (bpm < *plugin->average_tempo / 1.25){
+                                bpm *= 1.5;
+                            } else if (bpm < *plugin->average_tempo / 0.75){
+                                ;
+                            } else if (bpm < *plugin->average_tempo / 0.4){
+                                bpm *= 0.5;
+                            } else {
+                                valid_bpm = false;
+                            }
 
-                                if (bpm < *plugin->average_tempo / 5.0){
-                                    valid_bpm = false;
-                                } else if (bpm < *plugin->average_tempo / 3.5){
-                                    bpm *= 4;
-                                } else if (bpm < *plugin->average_tempo / 2.5){
-                                    bpm *= 3;
-                                } else if (bpm < *plugin->average_tempo / 1.75){
-                                    bpm *= 2;
-                                } else if (bpm < *plugin->average_tempo / 1.25){
-                                    bpm *= 1.5;
-                                } else if (bpm < *plugin->average_tempo / 0.75){
-                                    ;
-                                } else if (bpm < *plugin->average_tempo / 0.4){
-                                    bpm *= 0.5;
-                                } else {
-                                    valid_bpm = false;
-                                }
+                            if (! valid_bpm) plugin->n_taps_done = 1;
 
-
-                                if (valid_bpm){
-                                    a.send("/bpm", "f", bpm);
-                                    printf("Goooollllo %f\n", bpm);
-                                    a.send("/sequence", "si", "off", plugin->playing_column);
-                                    a.send("/sequence", "sii", "on", plugin->playing_column, 0);
-                                    a.send("/sequence", "sii", "on", plugin->playing_column, 1);
-                                    a.send("/play");
-                                    plugin->playing = true;
-                                } else {
-                                    plugin->n_taps_done = 1;
-                                }
+                            if (valid_bpm && plugin->n_taps_done >= n_taps){
+                                plugin->current_tempo = bpm;
+                                a.send("/bpm", "f", bpm);
+                                printf("Goooollllo %f\n", bpm);
+                                a.send("/sequence", "si", "off", plugin->playing_column);
+                                a.send("/sequence", "sii", "on", plugin->playing_column, 0);
+                                a.send("/sequence", "sii", "on", plugin->playing_column, 1);
+                                a.send("/play");
+                                plugin->playing = true;
                             }
                             break;
                     }
+                } else if (*plugin->moving_tempo > 0.0){
+                    float bpm = (60.0
+                                    / (plugin->frames_since_last_order_kick
+                                    / plugin->samplerate));
+                    bool valid_bpm = true;
+
+                    if (bpm < plugin->current_tempo / 5.0){
+                        valid_bpm = false;
+                    } else if (bpm < plugin->current_tempo / 3.5){
+                        bpm *= 4;
+                    } else if (bpm < plugin->current_tempo / 2.5){
+                        bpm *= 3;
+                    } else if (bpm < plugin->current_tempo / 1.75){
+                        bpm *= 2;
+                    } else if (bpm < plugin->current_tempo / 1.25){
+                        bpm *= 1.5;
+                    } else if (bpm < plugin->current_tempo / 0.75){
+                        ;
+                    } else if (bpm < plugin->current_tempo / 0.4){
+                        bpm *= 0.5;
+                    } else {
+                        valid_bpm = false;
+                    }
+
+                    if (valid_bpm){
+                        float new_ratio = *plugin->moving_tempo / 100.0;
+                        float new_bpm = new_ratio * bpm + (1.0 - new_ratio) * plugin->current_tempo;
+                        plugin->current_tempo = new_bpm;
+                        lo::Address a ("localhost", "2354");
+                        a.send("/bpm", "f", new_bpm);
+                    }
+
+                    if (*plugin->restart_cycle > 0.5){
+                        lo::Address a ("localhost", "2354");
+                        a.send("/play");
+                    }
                 }
 
+                order_kick_sample = ev->time.frames;
                 plugin->frames_since_last_order_kick = 0;
                 plugin->velocity_factor = ((const uint8_t*)(ev+1))[2] / 127.0;
                 plugin->muting = true;
@@ -444,6 +483,7 @@ void Multip::run(LV2_Handle instance, uint32_t n_samples)
                 if (0 == lv2_atom_forge_raw (&plugin->forge, msg, 3)) return;
                 lv2_atom_forge_pad (&plugin->forge, sizeof (LV2_Atom) + 3);
 
+                kick_sample = ev->time.frames;
                 plugin->frames_since_last_kick = 0;
             }
 
@@ -456,7 +496,8 @@ void Multip::run(LV2_Handle instance, uint32_t n_samples)
     while (!lv2_atom_sequence_is_end (&(plugin->midi_in)->body, (plugin->midi_in)->atom.size, m_ev)) {
         if (m_ev->body.type == plugin->uris.midi_MidiEvent) {
             if ((((const uint8_t*)(m_ev+1))[0] & 0x80 or ((const uint8_t*)(m_ev+1))[0] & 0x90)
-                    and not plugin->muting){
+                    and (not plugin->muting
+                         or plugin->frames_since_last_order_kick < plugin->pre_mute_frames)){
                 uint8_t chan = ((const uint8_t*)(m_ev+1))[0] & 0x0F;
 
                 if (chan != 0x0F){
@@ -479,6 +520,7 @@ void Multip::run(LV2_Handle instance, uint32_t n_samples)
                     }
 
                     if (msg[1] == 36){
+                        kick_sample = m_ev->time.frames;
                         plugin->frames_since_last_kick = 0;
                     }
                 } 
@@ -488,9 +530,8 @@ void Multip::run(LV2_Handle instance, uint32_t n_samples)
         m_ev = lv2_atom_sequence_next (m_ev);
     }
 
-    plugin->frames_since_last_kick += n_samples;
-    plugin->frames_since_last_order_kick += n_samples;
-    plugin->frames_since_first_tap += n_samples;
+    plugin->frames_since_last_kick += n_samples - kick_sample;
+    plugin->frames_since_last_order_kick += n_samples - order_kick_sample;
 
     if (plugin->playing and plugin->muting
             and plugin->frames_since_last_order_kick > (plugin->samplerate * (*plugin->stop_time / 1000.0))){

@@ -23,7 +23,16 @@
 #define ROUND(v) (uint32_t(v + 0.5f))
 
 #define PLUGIN_URI "http://plujain/plugins/multip"
-enum {MIDI_IN, MIDI_OUT, KICK_IN, PLAY_KICK, STOP_TIME, PLUGIN_PORT_COUNT};
+enum {
+    MIDI_IN,
+    MIDI_OUT,
+    PLAY_KICK,
+    KICK_SPACING,
+    STOP_TIME,
+    AVERAGE_TEMPO,
+    N_TAPS,
+    VALSE,
+    PLUGIN_PORT_COUNT};
 
 enum {BYPASS, FIRST_WAITING_PERIOD, WAITING_SIGNAL, FIRST_PERIOD, EFFECT, OUTING};
 
@@ -83,24 +92,28 @@ public:
     
     const LV2_Atom_Sequence *midi_in;
     LV2_Atom_Sequence *midi_out;
-    const LV2_Atom_Sequence *kick_in;
-    float *in_1;
-    float *in_2;
-    float *out;
-    float *active;
+    float *play_kick;
+    float *kick_spacing;
+    float *stop_time;
+    float *average_tempo;
+    float *n_taps;
+    float *valse;
+
     
     double samplerate;
     
     float velocity_factor;
+    uint64_t frames_since_last_order_kick;
     uint64_t frames_since_last_kick;
     bool muting;
+    bool playing;
+    uint8_t n_taps_done;
+    uint64_t frames_since_first_tap;
 
-    bool ex_active_state;
-    
-    int period_count;
-    int period_length;
-//     int perior
-    bool attacking;
+    uint8_t playing_column;
+    uint8_t playing_velo_row;
+    uint8_t playing_random_row;
+
     
     /* Host Time */
 	bool     host_info;
@@ -194,16 +207,16 @@ LV2_Handle Multip::instantiate(const LV2_Descriptor* descriptor, double samplera
     Multip *plugin = new Multip();
     
     plugin->samplerate = samplerate;
-    plugin->ex_active_state = false;
-    
-    plugin->period_count = 0;
-    plugin->period_length = 10000;
-//     plugin->perior = 0;
-    plugin->attacking = false;
 
     plugin->velocity_factor = 1.0;
     plugin->frames_since_last_kick = 0;
     plugin->muting = false;
+    plugin->playing = false;
+    plugin->frames_since_first_tap = 0;
+
+    plugin->playing_column = 0;
+    plugin->playing_velo_row = 2;
+    plugin->playing_random_row = 6;
     
     int i;
 	for (i=0; features[i]; ++i) {
@@ -254,21 +267,28 @@ void Multip::connect_port(LV2_Handle instance, uint32_t port, void *data)
     switch (port)
     {
         case MIDI_IN:
-            // plugin->in_1 = (float*) data;
             plugin->midi_in = (const LV2_Atom_Sequence*) data;
             break;
         case MIDI_OUT:
-            // plugin->in_2 = (float*) data;
             plugin->midi_out = (LV2_Atom_Sequence*) data;
             break;
-        case KICK_IN:
-            plugin->kick_in = (const LV2_Atom_Sequence*) data;
-            break;
         case PLAY_KICK:
-            // plugin->out = (float*) data;
+            plugin->play_kick = (float*) data;
+            break;
+        case KICK_SPACING:
+            plugin->kick_spacing = (float*) data;
             break;
         case STOP_TIME:
-            // plugin->active = (float*) data;
+            plugin->stop_time = (float*) data;
+            break;
+        case AVERAGE_TEMPO:
+            plugin->average_tempo = (float*) data;
+            break;
+        case N_TAPS:
+            plugin->n_taps = (float*) data;
+            break;
+        case VALSE:
+            plugin->valse = (float*) data;
             break;
     }
         
@@ -287,21 +307,126 @@ void Multip::run(LV2_Handle instance, uint32_t n_samples)
     lv2_atom_forge_set_buffer (&plugin->forge, (uint8_t*)plugin->midi_out, capacity);
     lv2_atom_forge_sequence_head (&plugin->forge, &plugin->frame, 0);
 
-    /* process control events (for host transport) */
-    LV2_Atom_Event* ev = lv2_atom_sequence_begin (&(plugin->kick_in)->body);
-    while (!lv2_atom_sequence_is_end (&(plugin->kick_in)->body, (plugin->kick_in)->atom.size, ev)) {
-        if (ev->body.type == plugin->uris.midi_MidiEvent) {
-            if (((const uint8_t*)(ev+1))[0] == 0x90){
-                // lo::Address a ("localhost", "2354");
-                // a.send("/play");
+    /* process control kick events 
+        note 36 on the last channel */
+    LV2_Atom_Event* ev = lv2_atom_sequence_begin (&(plugin->midi_in)->body);
+    while (!lv2_atom_sequence_is_end (&(plugin->midi_in)->body, (plugin->midi_in)->atom.size, ev)) {
+        if (ev->body.type == plugin->uris.midi_MidiEvent
+                and (((const uint8_t*)(ev+1))[0] == 0x9F
+                     or ((const uint8_t*)(ev+1))[0] == 0x8F)) {
+            if (((const uint8_t*)(ev+1))[0] == 0x9F){
+                printf("un kick on\n");
+                lo::Address a ("localhost", "2354");
+                if (not plugin->playing){
+
+                    uint8_t n_taps = *plugin->n_taps + 0.5;
+
+                    switch(n_taps){
+                        case 0:
+                            break;
+                        case 1:
+                            a.send("/bpm", "f", *plugin->average_tempo);
+                            plugin->playing_column = 0;
+                            a.send("/sequence", "si", "off", plugin->playing_column);
+                            a.send("/sequence", "sii", "on", plugin->playing_column, 0);
+                            a.send("/sequence", "sii", "on", plugin->playing_column, 1);
+                            a.send("/play");
+                            plugin->playing = true;
+                            break;
+                        default:
+                            if (plugin->n_taps_done == 0){
+                                plugin->frames_since_first_tap = 0;
+                            }
+
+                            plugin->n_taps_done += 1;
+
+                            printf("burllu %d\n", plugin->n_taps_done);
+
+                            if (plugin->n_taps_done >= n_taps){
+                                float bpm = (60
+                                             / (plugin->frames_since_last_order_kick
+                                                / plugin->samplerate));
+                                bool valid_bpm = true;
+
+                                if (bpm < *plugin->average_tempo / 5.0){
+                                    valid_bpm = false;
+                                } else if (bpm < *plugin->average_tempo / 3.5){
+                                    bpm *= 4;
+                                } else if (bpm < *plugin->average_tempo / 2.5){
+                                    bpm *= 3;
+                                } else if (bpm < *plugin->average_tempo / 1.75){
+                                    bpm *= 2;
+                                } else if (bpm < *plugin->average_tempo / 1.25){
+                                    bpm *= 1.5;
+                                } else if (bpm < *plugin->average_tempo / 0.75){
+                                    ;
+                                } else if (bpm < *plugin->average_tempo / 0.4){
+                                    bpm *= 0.5;
+                                } else {
+                                    valid_bpm = false;
+                                }
+
+
+                                if (valid_bpm){
+                                    a.send("/bpm", "f", bpm);
+                                    printf("Goooollllo %f\n", bpm);
+                                    a.send("/sequence", "si", "off", plugin->playing_column);
+                                    a.send("/sequence", "sii", "on", plugin->playing_column, 0);
+                                    a.send("/sequence", "sii", "on", plugin->playing_column, 1);
+                                    a.send("/play");
+                                    plugin->playing = true;
+                                } else {
+                                    plugin->n_taps_done = 1;
+                                }
+                            }
+                            break;
+                    }
+                }
+
+                plugin->frames_since_last_order_kick = 0;
                 plugin->velocity_factor = ((const uint8_t*)(ev+1))[2] / 127.0;
                 plugin->muting = true;
-            } else if (((const uint8_t*)(ev+1))[0] == 0x80){
+
+                /* choose velocity dependant sequence */
+                uint8_t velo_row = 2;
+
+                if (((const uint8_t*)(ev+1))[2] <= 32){
+                    velo_row = 2;
+                } else if (((const uint8_t*)(ev+1))[2] <= 64){
+                    velo_row = 3;
+                } else if (((const uint8_t*)(ev+1))[2] <= 96){
+                    velo_row = 4;
+                } else {
+                    velo_row = 5;
+                }
+
+                if (velo_row != plugin->playing_velo_row){
+                    a.send("/sequence", "sii", "off", plugin->playing_column,
+                           plugin->playing_velo_row);
+                    a.send("/sequence", "sii", "on", plugin->playing_column, velo_row);
+                    printf("Velo row %d\n", velo_row);
+                    plugin->playing_velo_row = velo_row;
+                }
+
+                /* manage random sequences*/
+                srand((unsigned) time(NULL));
+                uint8_t random_row = 6;
+
+                while (random_row == plugin->playing_random_row){
+                    random_row = 6 + (rand() % 5);
+                }
+
+                a.send("/sequence", "sii", "off", plugin->playing_column,
+                        plugin->playing_random_row);
+                a.send("/sequence", "sii", "on", plugin->playing_column,
+                        random_row);
+                plugin->playing_random_row = random_row;
+
+
+            } else if (((const uint8_t*)(ev+1))[0] == 0x8F){
                 plugin->muting = false;
             }
-        }
 
-        if (((const uint8_t*)(ev+1))[0] & 0x90 or ((const uint8_t*)(ev+1))[0] & 0x80){
             LV2_Atom midiatom;
             midiatom.type = plugin->uris.midi_MidiEvent;
             midiatom.size = 3;
@@ -311,11 +436,14 @@ void Multip::run(LV2_Handle instance, uint32_t n_samples)
             msg[1] = ((const uint8_t*)(ev+1))[1]; /* Note number */
             msg[2] = ((const uint8_t*)(ev+1))[2]; /* Velocity */
 
-            if (plugin->frames_since_last_kick > 3000){
+            if (*plugin->play_kick > 0.5
+                    and plugin->frames_since_last_kick
+                        > plugin->samplerate * (*plugin->kick_spacing / 1000.0)){
                 if (0 == lv2_atom_forge_frame_time (&plugin->forge, ev->time.frames)) return;
                 if (0 == lv2_atom_forge_raw (&plugin->forge, &midiatom, sizeof (LV2_Atom))) return;
                 if (0 == lv2_atom_forge_raw (&plugin->forge, msg, 3)) return;
                 lv2_atom_forge_pad (&plugin->forge, sizeof (LV2_Atom) + 3);
+
                 plugin->frames_since_last_kick = 0;
             }
 
@@ -323,32 +451,37 @@ void Multip::run(LV2_Handle instance, uint32_t n_samples)
         ev = lv2_atom_sequence_next (ev);
     }
 
+    /* Process all other MIDI messages */
     LV2_Atom_Event* m_ev = lv2_atom_sequence_begin (&(plugin->midi_in)->body);
     while (!lv2_atom_sequence_is_end (&(plugin->midi_in)->body, (plugin->midi_in)->atom.size, m_ev)) {
         if (m_ev->body.type == plugin->uris.midi_MidiEvent) {
             if ((((const uint8_t*)(m_ev+1))[0] & 0x80 or ((const uint8_t*)(m_ev+1))[0] & 0x90)
                     and not plugin->muting){
-                LV2_Atom midiatom;
-                midiatom.type = plugin->uris.midi_MidiEvent;
-                midiatom.size = 3;
-                
-                uint8_t msg[3];
-                msg[0] = ((const uint8_t*)(m_ev+1))[0]; /* Note on or off with channel*/
-                msg[1] = ((const uint8_t*)(m_ev+1))[1]; /* Note number */
-                msg[2] = ((const uint8_t*)(m_ev+1))[2] * plugin->velocity_factor; /* Velocity */
+                uint8_t chan = ((const uint8_t*)(m_ev+1))[0] & 0x0F;
 
-                if (msg[1] == 36 and plugin->frames_since_last_kick < 3000){
-                    ;
-                } else {
-                    if (0 == lv2_atom_forge_frame_time (&plugin->forge, m_ev->time.frames)) return;
-                    if (0 == lv2_atom_forge_raw (&plugin->forge, &midiatom, sizeof (LV2_Atom))) return;
-                    if (0 == lv2_atom_forge_raw (&plugin->forge, msg, 3)) return;
-                    lv2_atom_forge_pad (&plugin->forge, sizeof (LV2_Atom) + 3);
-                }
+                if (chan != 0x0F){
+                    LV2_Atom midiatom;
+                    midiatom.type = plugin->uris.midi_MidiEvent;
+                    midiatom.size = 3;
+                    
+                    uint8_t msg[3];
+                    msg[0] = ((const uint8_t*)(m_ev+1))[0]; /* Note on or off with channel*/
+                    msg[1] = ((const uint8_t*)(m_ev+1))[1]; /* Note number */
+                    msg[2] = ((const uint8_t*)(m_ev+1))[2] * plugin->velocity_factor; /* Velocity */
 
-                if (msg[1] == 36){
-                    plugin->frames_since_last_kick = 0;
-                }
+                    if (msg[1] == 36 and plugin->frames_since_last_kick < plugin->samplerate * (*plugin->kick_spacing / 1000.0)){
+                        ;
+                    } else {
+                        if (0 == lv2_atom_forge_frame_time (&plugin->forge, m_ev->time.frames)) return;
+                        if (0 == lv2_atom_forge_raw (&plugin->forge, &midiatom, sizeof (LV2_Atom))) return;
+                        if (0 == lv2_atom_forge_raw (&plugin->forge, msg, 3)) return;
+                        lv2_atom_forge_pad (&plugin->forge, sizeof (LV2_Atom) + 3);
+                    }
+
+                    if (msg[1] == 36){
+                        plugin->frames_since_last_kick = 0;
+                    }
+                } 
 
             }
         }
@@ -356,42 +489,16 @@ void Multip::run(LV2_Handle instance, uint32_t n_samples)
     }
 
     plugin->frames_since_last_kick += n_samples;
- 
+    plugin->frames_since_last_order_kick += n_samples;
+    plugin->frames_since_first_tap += n_samples;
 
-    // bool active_state = bool(*plugin->active > 0.5f);
-    
-    // lo::Address a ("localhost", "2354");
-    // a.send("/play");
-
-    // for ( uint32_t i = 0; i < n_samples; i++)
-    // {
-    //     if (active_state){
-    //         float current_value = float(plugin->in[i]);
-    //         if (plugin->attacking){
-    //             if (plugin->period_count < 200){
-    //                 plugin->out[i] = (1 - plugin->period_count/float(200)) * current_value;
-    //             } else {
-    //                 plugin->out[i] = (plugin->period_count -200)/float(plugin->period_length -200) * current_value;
-    //             }
-                
-    //             plugin->period_count++;
-    //             if (plugin->period_count == plugin->period_length){
-    //                 plugin->attacking = false;
-    //             }
-                
-    //         } else {
-    //             if (current_value > 0.2){
-    //                 ;
-    //             }
-                    
-    //     } else {
-    //         plugin->out[i] = plugin->in_1[i];
-    //     }
-        
-        
-    // }
-       
-    // plugin->ex_active_state = active_state;
+    if (plugin->playing and plugin->muting
+            and plugin->frames_since_last_order_kick > (plugin->samplerate * (*plugin->stop_time / 1000.0))){
+        lo::Address a ("localhost", "2354");
+        a.send("/stop");
+        plugin->playing = false;
+        plugin->n_taps_done = 0;
+    }
 }
 
 /**********************************************************************************************************************************************************/

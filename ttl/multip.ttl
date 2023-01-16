@@ -135,4 +135,15 @@ lv2:port
     lv2:minimum 0 ;
     lv2:maximum 100 ;
     lv2:designation lv2:enabled ;
+],
+[
+    a lv2:InputPort, lv2:ControlPort ;
+    lv2:index 9;
+    lv2:symbol "demuter_note" ;
+    lv2:name "Upper Demuter Note" ;
+    lv2:default 43 ;
+    lv2:minimum 0 ;
+    lv2:maximum 127 ;
+    lv2:portProperty lv2:integer ;
+    lv2:designation lv2:enabled ;
 ].

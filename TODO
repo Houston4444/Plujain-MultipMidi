@@ -2,9 +2,11 @@
 passer à la colonne suivante avec autre commande
 velocité gérée
 attendre snare ou kick après mute long
-virer VALSE
 server liblo
 n° port seq192
 
-option redémarrer cycle au pied
-Autoriser double kick écrit
+# option redémarrer cycle au pied
+# Autoriser double kick écrit
+random passe par une note basse (30?)
+
+vérifier ligne et background sequence

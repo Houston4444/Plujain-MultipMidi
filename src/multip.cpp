@@ -337,7 +337,6 @@ void Multip::run(LV2_Handle instance, uint32_t n_samples)
             if (((const uint8_t*)(ev+1))[0] == 0x9F){
                 lo::Address a ("localhost", "2354");
                 if (not plugin->playing){
-
                     uint8_t n_taps = *plugin->n_taps + 0.5;
 
                     switch(n_taps){
@@ -347,7 +346,8 @@ void Multip::run(LV2_Handle instance, uint32_t n_samples)
                             plugin->current_tempo = *plugin->average_tempo;
                             a.send("/bpm", "f", *plugin->average_tempo);
                             plugin->playing_column = 0;
-                            a.send("/sequence", "si", "off", plugin->playing_column);
+                            // a.send("/sequence", "si", "off", plugin->playing_column);
+                            a.send("/panic");
                             a.send("/sequence", "sii", "on", plugin->playing_column, 0);
                             a.send("/sequence", "sii", "on", plugin->playing_column, 1);
                             a.send("/sequence", "sii", "on", plugin->playing_column, plugin->playing_random_row);
@@ -386,7 +386,8 @@ void Multip::run(LV2_Handle instance, uint32_t n_samples)
                             if (valid_bpm && plugin->n_taps_done >= n_taps){
                                 plugin->current_tempo = bpm;
                                 a.send("/bpm", "f", bpm);
-                                a.send("/sequence", "si", "off", plugin->playing_column);
+                                // a.send("/sequence", "si", "off", plugin->playing_column);
+                                a.send("/panic");
                                 a.send("/sequence", "sii", "on", plugin->playing_column, 0);
                                 a.send("/sequence", "sii", "on", plugin->playing_column, 1);
                                 a.send("/sequence", "sii", "on", plugin->playing_column, plugin->playing_random_row);

@@ -146,4 +146,26 @@ lv2:port
     lv2:maximum 127 ;
     lv2:portProperty lv2:integer ;
     lv2:designation lv2:enabled ;
+],
+[
+    a lv2:InputPort, lv2:ControlPort ;
+    lv2:index 10;
+    lv2:symbol "big_sequence" ;
+    lv2:name "Big Sequence" ;
+    lv2:default 0 ;
+    lv2:minimum 0 ;
+    lv2:maximum 6 ;
+    lv2:portProperty lv2:integer ;
+    lv2:designation lv2:enabled ;
+],
+[
+    a lv2:InputPort, lv2:ControlPort ;
+    lv2:index 11;
+    lv2:symbol "seq192_port" ;
+    lv2:name "Seq192 Osc Port" ;
+    lv2:default 2354 ;
+    lv2:minimum 1024 ;
+    lv2:maximum 9999 ;
+    lv2:portProperty lv2:integer ;
+    lv2:designation lv2:enabled ;
 ].

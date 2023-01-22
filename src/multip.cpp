@@ -34,6 +34,8 @@ enum {
     RESTART_CYCLE,
     MOVING_TEMPO,
     DEMUTER_NOTE,
+    BIG_SEQUENCE,
+    SEQ_OSC_PORT,
     PLUGIN_PORT_COUNT};
 
 enum {BYPASS, FIRST_WAITING_PERIOD, WAITING_SIGNAL, FIRST_PERIOD, EFFECT, OUTING};
@@ -91,6 +93,7 @@ public:
     static void run(LV2_Handle instance, uint32_t n_samples);
     static void cleanup(LV2_Handle instance);
     static const void* extension_data(const char* uri);
+    std::string port_str();
     
     const LV2_Atom_Sequence *midi_in;
     LV2_Atom_Sequence *midi_out;
@@ -102,7 +105,8 @@ public:
     float *restart_cycle;
     float *moving_tempo;
     float *demuter_note;
-
+    float *big_sequence;
+    float *seq_osc_port;
     
     double samplerate;
     uint32_t pre_mute_frames;
@@ -117,9 +121,9 @@ public:
     uint8_t n_taps_done;
     float current_tempo;
 
-    uint8_t playing_column;
     uint8_t playing_velo_row;
     uint8_t playing_random_row;
+    uint8_t last_big_sequence;
 
     
     /* Host Time */
@@ -224,9 +228,9 @@ LV2_Handle Multip::instantiate(const LV2_Descriptor* descriptor, double samplera
     plugin->playing = false;
     plugin->after_long_mute = false;
 
-    plugin->playing_column = 0;
     plugin->playing_velo_row = 2;
-    plugin->playing_random_row = 6;
+    plugin->playing_random_row = 2;
+    plugin->last_big_sequence = 0;
     
     int i;
 	for (i=0; features[i]; ++i) {
@@ -306,6 +310,12 @@ void Multip::connect_port(LV2_Handle instance, uint32_t port, void *data)
         case DEMUTER_NOTE:
             plugin->demuter_note = (float*) data;
             break;
+        case BIG_SEQUENCE:
+            plugin->big_sequence = (float*) data;
+            break;
+        case SEQ_OSC_PORT:
+            plugin->seq_osc_port = (float*) data;
+            break;
     }
         
 }
@@ -326,6 +336,17 @@ void Multip::run(LV2_Handle instance, uint32_t n_samples)
     uint32_t kick_sample = 0;
     uint32_t order_kick_sample = 0;
     uint32_t random_change_sample = 0;
+    uint8_t big_sequence = *plugin->big_sequence + 0.5;
+
+    if (big_sequence != plugin->last_big_sequence){
+        lo::Address a ("localhost", plugin->port_str());
+        a.send("/sequence/queue", "si", "off", plugin->last_big_sequence * 2);
+        a.send("/sequence/queue", "si", "off", 1 + plugin->last_big_sequence * 2);
+        a.send("/sequence/queue", "siii", "on", big_sequence * 2 , 0, 1);
+        a.send("/sequence/queue", "siii", "on", 1 + big_sequence * 2 , 0, 1);
+        a.send("/sequence/queue", "sii", "on", big_sequence * 2, plugin->playing_velo_row);
+        a.send("/sequence/queue", "sii", "on", 1 + big_sequence * 2, plugin->playing_random_row);
+    }
 
     /* process control kick events 
         note 36 on the last channel */
@@ -335,9 +356,10 @@ void Multip::run(LV2_Handle instance, uint32_t n_samples)
                 and (((const uint8_t*)(ev+1))[0] == 0x9F
                      or ((const uint8_t*)(ev+1))[0] == 0x8F)) {
             if (((const uint8_t*)(ev+1))[0] == 0x9F){
-                lo::Address a ("localhost", "2354");
+                lo::Address a ("localhost", plugin->port_str());
                 if (not plugin->playing){
                     uint8_t n_taps = *plugin->n_taps + 0.5;
+                    bool start_play = false;
 
                     switch(n_taps){
                         case 0:
@@ -345,15 +367,7 @@ void Multip::run(LV2_Handle instance, uint32_t n_samples)
                         case 1:
                             plugin->current_tempo = *plugin->average_tempo;
                             a.send("/bpm", "f", *plugin->average_tempo);
-                            plugin->playing_column = 0;
-                            // a.send("/sequence", "si", "off", plugin->playing_column);
-                            a.send("/panic");
-                            a.send("/sequence", "sii", "on", plugin->playing_column, 0);
-                            a.send("/sequence", "sii", "on", plugin->playing_column, 1);
-                            a.send("/sequence", "sii", "on", plugin->playing_column, plugin->playing_random_row);
-                            a.send("/sequence", "sii", "on", plugin->playing_column, plugin->playing_velo_row);
-                            a.send("/play");
-                            plugin->playing = true;
+                            start_play = true;
                             break;
                         default:
                             plugin->n_taps_done += 1;
@@ -386,17 +400,22 @@ void Multip::run(LV2_Handle instance, uint32_t n_samples)
                             if (valid_bpm && plugin->n_taps_done >= n_taps){
                                 plugin->current_tempo = bpm;
                                 a.send("/bpm", "f", bpm);
-                                // a.send("/sequence", "si", "off", plugin->playing_column);
-                                a.send("/panic");
-                                a.send("/sequence", "sii", "on", plugin->playing_column, 0);
-                                a.send("/sequence", "sii", "on", plugin->playing_column, 1);
-                                a.send("/sequence", "sii", "on", plugin->playing_column, plugin->playing_random_row);
-                                a.send("/sequence", "sii", "on", plugin->playing_column, plugin->playing_velo_row);
-                                a.send("/play");
-                                plugin->playing = true;
+                                start_play = true;      
                             }
                             break;
                     }
+
+                    if (start_play){
+                        printf("ouhouh start play\n");
+                        a.send("/panic");
+                        a.send("/sequence", "siii", "on", big_sequence * 2, 0, 1);
+                        a.send("/sequence", "siii", "on", 1 + big_sequence * 2, 0, 1);
+                        a.send("/sequence", "sii", "on", big_sequence * 2, plugin->playing_velo_row);
+                        a.send("/sequence", "sii", "on", 1 + big_sequence * 2, plugin->playing_random_row);
+                        a.send("/play");
+                        plugin->playing = true;
+                    }
+
                 } else if (*plugin->moving_tempo > 0.0){
                     float bpm = (60.0
                                     / (plugin->frames_since_last_order_kick
@@ -425,13 +444,13 @@ void Multip::run(LV2_Handle instance, uint32_t n_samples)
                         float new_ratio = *plugin->moving_tempo / 100.0;
                         float new_bpm = new_ratio * bpm + (1.0 - new_ratio) * plugin->current_tempo;
                         plugin->current_tempo = new_bpm;
-                        lo::Address a ("localhost", "2354");
+                        lo::Address a ("localhost", plugin->port_str());
                         a.send("/bpm", "f", new_bpm);
                     }
                 }
 
                 if (*plugin->restart_cycle > 0.5){
-                    lo::Address a ("localhost", "2354");
+                    lo::Address a ("localhost", plugin->port_str());
                     a.send("/play");
                 }
 
@@ -455,27 +474,12 @@ void Multip::run(LV2_Handle instance, uint32_t n_samples)
                 }
 
                 if (velo_row != plugin->playing_velo_row){
-                    a.send("/sequence", "sii", "off", plugin->playing_column,
+                    a.send("/sequence", "sii", "off", big_sequence * 2,
                            plugin->playing_velo_row);
-                    a.send("/sequence", "sii", "on", plugin->playing_column, velo_row);
-                    printf("Velo row %d\n", velo_row);
+                    a.send("/sequence", "sii", "on", big_sequence * 2, velo_row);
+                    // printf("Velo row %d\n", velo_row);
                     plugin->playing_velo_row = velo_row;
                 }
-
-                // /* manage random sequences*/
-                // srand((unsigned) time(NULL));
-                // uint8_t random_row = 6;
-
-                // while (random_row == plugin->playing_random_row){
-                //     random_row = 6 + (rand() % 5);
-                // }
-
-                // a.send("/sequence", "sii", "off", plugin->playing_column,
-                //         plugin->playing_random_row);
-                // a.send("/sequence", "sii", "on", plugin->playing_column,
-                //         random_row);
-                // plugin->playing_random_row = random_row;
-
 
             } else if (((const uint8_t*)(ev+1))[0] == 0x8F){
                 plugin->muting = false;
@@ -509,15 +513,32 @@ void Multip::run(LV2_Handle instance, uint32_t n_samples)
         ev = lv2_atom_sequence_next (ev);
     }
 
+    uint8_t full_command;
+    uint8_t command;
+    uint8_t chan;
+
     /* Process all other MIDI messages */
     LV2_Atom_Event* m_ev = lv2_atom_sequence_begin (&(plugin->midi_in)->body);
     while (!lv2_atom_sequence_is_end (&(plugin->midi_in)->body, (plugin->midi_in)->atom.size, m_ev)) {
         if (m_ev->body.type == plugin->uris.midi_MidiEvent) {
-            if ((((const uint8_t*)(m_ev+1))[0] & 0x80 or ((const uint8_t*)(m_ev+1))[0] & 0x90)
+            full_command = ((const uint8_t*)(m_ev+1))[0];
+
+            if (full_command & 0xf0){
+                command = full_command;
+                chan = 0;
+            } else {
+                command = full_command & ~0x0F;
+                chan = full_command & 0x0F;
+            }
+
+            if (chan == 0x0F){
+                m_ev = lv2_atom_sequence_next (m_ev);
+                continue;
+            }
+
+            if (command == 0x90
                     and (not plugin->muting
                          or plugin->frames_since_last_order_kick < plugin->pre_mute_frames)){
-                uint8_t chan = ((const uint8_t*)(m_ev+1))[0] & 0x0F;
-
                 if (chan != 0x0F){
                     LV2_Atom midiatom;
                     midiatom.type = plugin->uris.midi_MidiEvent;
@@ -538,14 +559,14 @@ void Multip::run(LV2_Handle instance, uint32_t n_samples)
                         uint8_t random_row = plugin->playing_random_row;
 
                         while (random_row == plugin->playing_random_row){
-                            random_row = 6 + (rand() % 5);
+                            random_row = 2 + (rand() % 5);
                         }
 
                         random_change_sample = ev->time.frames;
-                        lo::Address a ("localhost", "2354");
-                        a.send("/sequence", "sii", "off", plugin->playing_column,
+                        lo::Address a ("localhost", plugin->port_str());
+                        a.send("/sequence", "sii", "off", 1 + big_sequence * 2,
                                 plugin->playing_random_row);
-                        a.send("/sequence", "sii", "on", plugin->playing_column,
+                        a.send("/sequence", "sii", "on", 1 + big_sequence * 2,
                                 random_row);
                         plugin->playing_random_row = random_row;
                         plugin->frames_since_last_random_change = 0;
@@ -570,8 +591,17 @@ void Multip::run(LV2_Handle instance, uint32_t n_samples)
                             && msg[1] < uint16_t(*plugin->demuter_note + 0.5)){
                         plugin->after_long_mute = false;
                     }
-                } 
+                }
 
+            } else if (command != 0x90){
+                LV2_Atom midiatom;
+                midiatom.type = plugin->uris.midi_MidiEvent;
+                midiatom.size = m_ev->body.size;
+
+                if (0 == lv2_atom_forge_frame_time (&plugin->forge, m_ev->time.frames)) return;
+                if (0 == lv2_atom_forge_raw (&plugin->forge, &midiatom, sizeof (LV2_Atom))) return;
+                if (0 == lv2_atom_forge_raw (&plugin->forge, (m_ev+1), 3)) return;
+                lv2_atom_forge_pad (&plugin->forge, sizeof (LV2_Atom) + 3);
             }
         }
         m_ev = lv2_atom_sequence_next (m_ev);
@@ -579,7 +609,7 @@ void Multip::run(LV2_Handle instance, uint32_t n_samples)
 
     if (plugin->playing and plugin->muting
             and plugin->frames_since_last_order_kick > (plugin->samplerate * (*plugin->stop_time / 1000.0))){
-        lo::Address a ("localhost", "2354");
+        lo::Address a ("localhost", plugin->port_str());
         a.send("/stop");
         plugin->playing = false;
         plugin->n_taps_done = 0;
@@ -588,6 +618,7 @@ void Multip::run(LV2_Handle instance, uint32_t n_samples)
     plugin->frames_since_last_kick += n_samples - kick_sample;
     plugin->frames_since_last_order_kick += n_samples - order_kick_sample;
     plugin->frames_since_last_random_change += n_samples - random_change_sample;
+    plugin->last_big_sequence = big_sequence;
 
 }
 
@@ -603,4 +634,8 @@ void Multip::cleanup(LV2_Handle instance)
 const void* Multip::extension_data(const char* uri)
 {
     return NULL;
+}
+
+std::string Multip::port_str(){
+    return std::to_string(uint16_t(*seq_osc_port));
 }

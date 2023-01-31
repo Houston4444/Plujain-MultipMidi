@@ -22,10 +22,12 @@
 #define RAIL(v, min, max) (MIN((max), MAX((min), (v))))
 #define ROUND(v) (uint32_t(v + 0.5f))
 
+
 #define PLUGIN_URI "http://plujain/plugins/multip"
 enum {
     MIDI_IN,
     MIDI_OUT,
+    SOOP_OUT,
     PLAY_KICK,
     KICK_SPACING,
     STOP_TIME,
@@ -34,6 +36,7 @@ enum {
     RESTART_CYCLE,
     MOVING_TEMPO,
     DEMUTER_NOTE,
+    DRUM_CHANNEL_MAX,
     BIG_SEQUENCE,
     SEQ_OSC_PORT,
     PLUGIN_PORT_COUNT};
@@ -41,6 +44,7 @@ enum {
 enum {BYPASS, FIRST_WAITING_PERIOD, WAITING_SIGNAL, FIRST_PERIOD, EFFECT, OUTING};
 
 enum {MODE_ACTIVE, MODE_THRESHOLD, MODE_HOST_TRANSPORT, MODE_MIDI, MODE_MIDI_BYPASS};
+
 
 typedef struct {
 	LV2_URID atom_Blank;
@@ -92,11 +96,14 @@ public:
     static void connect_port(LV2_Handle instance, uint32_t port, void *data);
     static void run(LV2_Handle instance, uint32_t n_samples);
     static void cleanup(LV2_Handle instance);
+
+    void send_soop(lo::Address &sla, const std::string& act_type, const std::string& action);
     static const void* extension_data(const char* uri);
     std::string port_str();
     
     const LV2_Atom_Sequence *midi_in;
     LV2_Atom_Sequence *midi_out;
+    LV2_Atom_Sequence *soop_out;
     float *play_kick;
     float *kick_spacing;
     float *stop_time;
@@ -105,6 +112,7 @@ public:
     float *restart_cycle;
     float *moving_tempo;
     float *demuter_note;
+    float *drum_channel_max;
     float *big_sequence;
     float *seq_osc_port;
     
@@ -125,7 +133,6 @@ public:
     uint8_t playing_random_row;
     uint8_t last_big_sequence;
 
-    
     /* Host Time */
 	bool     host_info;
 	float    host_bpm;
@@ -159,6 +166,7 @@ static const LV2_Descriptor Descriptor = {
 };
 
 /**********************************************************************************************************************************************************/
+
 
 static void
 update_position (Multip* plugin, const LV2_Atom_Object* obj)
@@ -258,6 +266,12 @@ LV2_Handle Multip::instantiate(const LV2_Descriptor* descriptor, double samplera
 
 /*******************************/
 
+void Multip::send_soop(lo::Address &sla, const std::string &act_type, const std::string &action){
+    std::string path = "/sl/0/" + act_type;
+    sla.send(path.c_str(), "s", action.c_str());
+    printf("AZA %s %s\n", act_type.c_str(), action.c_str());
+}
+
 void Multip::activate(LV2_Handle instance)
 {
     // TODO: include the activate function code here
@@ -286,6 +300,9 @@ void Multip::connect_port(LV2_Handle instance, uint32_t port, void *data)
         case MIDI_OUT:
             plugin->midi_out = (LV2_Atom_Sequence*) data;
             break;
+        case SOOP_OUT:
+            plugin->soop_out = (LV2_Atom_Sequence*) data;
+            break;
         case PLAY_KICK:
             plugin->play_kick = (float*) data;
             break;
@@ -310,6 +327,9 @@ void Multip::connect_port(LV2_Handle instance, uint32_t port, void *data)
         case DEMUTER_NOTE:
             plugin->demuter_note = (float*) data;
             break;
+        case DRUM_CHANNEL_MAX:
+            plugin->drum_channel_max = (float*) data;
+            break;
         case BIG_SEQUENCE:
             plugin->big_sequence = (float*) data;
             break;
@@ -319,6 +339,8 @@ void Multip::connect_port(LV2_Handle instance, uint32_t port, void *data)
     }
         
 }
+
+
 
 /********************/
 
@@ -340,6 +362,7 @@ void Multip::run(LV2_Handle instance, uint32_t n_samples)
 
     if (big_sequence != plugin->last_big_sequence){
         lo::Address a ("localhost", plugin->port_str());
+        a.send("/sequence", "sii", "sync", plugin->last_big_sequence * 2, 0);
         a.send("/sequence/queue", "si", "off", plugin->last_big_sequence * 2);
         a.send("/sequence/queue", "si", "off", 1 + plugin->last_big_sequence * 2);
         a.send("/sequence/queue", "siii", "on", big_sequence * 2 , 0, 1);
@@ -348,15 +371,39 @@ void Multip::run(LV2_Handle instance, uint32_t n_samples)
         a.send("/sequence/queue", "sii", "on", 1 + big_sequence * 2, plugin->playing_random_row);
     }
 
+    uint8_t* orig_msg;
+    uint8_t full_command;
+    uint8_t command;
+    uint8_t chan;
+
     /* process control kick events 
         note 36 on the last channel */
     LV2_Atom_Event* ev = lv2_atom_sequence_begin (&(plugin->midi_in)->body);
     while (!lv2_atom_sequence_is_end (&(plugin->midi_in)->body, (plugin->midi_in)->atom.size, ev)) {
-        if (ev->body.type == plugin->uris.midi_MidiEvent
-                and (((const uint8_t*)(ev+1))[0] == 0x9F
-                     or ((const uint8_t*)(ev+1))[0] == 0x8F)) {
-            if (((const uint8_t*)(ev+1))[0] == 0x9F){
+        if (ev->body.type == plugin->uris.midi_MidiEvent){
+            orig_msg = ((uint8_t*)(ev+1));
+            full_command = orig_msg[0];
+            if ((full_command & 0xF0) == 0xF0){
+                command = full_command;
+                chan = 0;
+            } else {
+                command = full_command & ~0x0F;
+                chan = full_command & 0x0F;
+            }
+            
+            if (chan != 0x0F){
+                ev = lv2_atom_sequence_next (ev);
+                continue;
+            }
+
+            if (! (full_command == 0x9F || full_command == 0x8F)){
+                ev = lv2_atom_sequence_next (ev);
+                continue;
+            }
+
+            if (full_command == 0x9F){
                 lo::Address a ("localhost", plugin->port_str());
+                lo::Address mt ("localhost", "4687");
                 if (not plugin->playing){
                     uint8_t n_taps = *plugin->n_taps + 0.5;
                     bool start_play = false;
@@ -367,6 +414,7 @@ void Multip::run(LV2_Handle instance, uint32_t n_samples)
                         case 1:
                             plugin->current_tempo = *plugin->average_tempo;
                             a.send("/bpm", "f", *plugin->average_tempo);
+                            mt.send("/bpm", "f", *plugin->average_tempo);
                             start_play = true;
                             break;
                         default:
@@ -406,7 +454,6 @@ void Multip::run(LV2_Handle instance, uint32_t n_samples)
                     }
 
                     if (start_play){
-                        printf("ouhouh start play\n");
                         a.send("/panic");
                         a.send("/sequence", "siii", "on", big_sequence * 2, 0, 1);
                         a.send("/sequence", "siii", "on", 1 + big_sequence * 2, 0, 1);
@@ -456,18 +503,18 @@ void Multip::run(LV2_Handle instance, uint32_t n_samples)
 
                 order_kick_sample = ev->time.frames;
                 plugin->frames_since_last_order_kick = 0;
-                plugin->velocity_factor = ((const uint8_t*)(ev+1))[2] / 127.0;
+                plugin->velocity_factor = orig_msg[2] / 127.0;
                 plugin->muting = true;
                 plugin->after_long_mute = false;
 
                 /* choose velocity dependant sequence */
                 uint8_t velo_row;
 
-                if (((const uint8_t*)(ev+1))[2] <= 32){
+                if (orig_msg[2] <= 32){
                     velo_row = 2;
-                } else if (((const uint8_t*)(ev+1))[2] <= 64){
+                } else if (orig_msg[2] <= 64){
                     velo_row = 3;
-                } else if (((const uint8_t*)(ev+1))[2] <= 96){
+                } else if (orig_msg[2] <= 96){
                     velo_row = 4;
                 } else {
                     velo_row = 5;
@@ -477,25 +524,23 @@ void Multip::run(LV2_Handle instance, uint32_t n_samples)
                     a.send("/sequence", "sii", "off", big_sequence * 2,
                            plugin->playing_velo_row);
                     a.send("/sequence", "sii", "on", big_sequence * 2, velo_row);
-                    // printf("Velo row %d\n", velo_row);
                     plugin->playing_velo_row = velo_row;
                 }
-
-            } else if (((const uint8_t*)(ev+1))[0] == 0x8F){
+            } else if (full_command == 0x8F){
                 plugin->muting = false;
                 if (plugin->frames_since_last_order_kick > 4800){
                     plugin->after_long_mute = true;
                 }
             }
 
-            LV2_Atom midiatom;
+            LV2_Atom midiatom;//
             midiatom.type = plugin->uris.midi_MidiEvent;
             midiatom.size = 3;
             
             uint8_t msg[3];
-            msg[0] = ((const uint8_t*)(ev+1))[0]; /* Note on or off with channel*/
-            msg[1] = ((const uint8_t*)(ev+1))[1]; /* Note number */
-            msg[2] = ((const uint8_t*)(ev+1))[2]; /* Velocity */
+            msg[0] = command; /* Note on or off with channel 0*/
+            msg[1] = orig_msg[1]; /* Note number */
+            msg[2] = orig_msg[2]; /* Velocity */
 
             if (*plugin->play_kick > 0.5
                     and plugin->frames_since_last_kick
@@ -508,22 +553,18 @@ void Multip::run(LV2_Handle instance, uint32_t n_samples)
                 kick_sample = ev->time.frames;
                 plugin->frames_since_last_kick = 0;
             }
-
         }
         ev = lv2_atom_sequence_next (ev);
     }
-
-    uint8_t full_command;
-    uint8_t command;
-    uint8_t chan;
 
     /* Process all other MIDI messages */
     LV2_Atom_Event* m_ev = lv2_atom_sequence_begin (&(plugin->midi_in)->body);
     while (!lv2_atom_sequence_is_end (&(plugin->midi_in)->body, (plugin->midi_in)->atom.size, m_ev)) {
         if (m_ev->body.type == plugin->uris.midi_MidiEvent) {
-            full_command = ((const uint8_t*)(m_ev+1))[0];
+            orig_msg = ((uint8_t*)(m_ev+1));
+            full_command = orig_msg[0];
 
-            if (full_command & 0xf0){
+            if ((full_command & 0xF0) == 0xF0){
                 command = full_command;
                 chan = 0;
             } else {
@@ -539,58 +580,58 @@ void Multip::run(LV2_Handle instance, uint32_t n_samples)
             if (command == 0x90
                     and (not plugin->muting
                          or plugin->frames_since_last_order_kick < plugin->pre_mute_frames)){
-                if (chan != 0x0F){
-                    LV2_Atom midiatom;
-                    midiatom.type = plugin->uris.midi_MidiEvent;
-                    midiatom.size = 3;
-                    
-                    uint8_t msg[3];
-                    msg[0] = ((const uint8_t*)(m_ev+1))[0]; /* Note on or off with channel*/
-                    msg[1] = ((const uint8_t*)(m_ev+1))[1]; /* Note number */
-                    msg[2] = ((const uint8_t*)(m_ev+1))[2] * plugin->velocity_factor; /* Velocity */
+                LV2_Atom midiatom;
+                midiatom.type = plugin->uris.midi_MidiEvent;
+                midiatom.size = 3;
+                
+                uint8_t msg[3];
+                msg[0] = full_command; /* Note on or off with channel*/
+                msg[1] = orig_msg[1]; /* Note number */
+                msg[2] = orig_msg[2] * plugin->velocity_factor; /* Velocity */
 
-                    if (msg[1] == 36
-                        and *plugin->play_kick > 0.5
-                        and plugin->frames_since_last_order_kick < plugin->samplerate * (*plugin->kick_spacing / 1000.0)){
-                        ;
-                    } else if (msg[1] == 30 and plugin->frames_since_last_random_change > 24000){
-                        /* manage random sequences*/
-                        srand((unsigned) time(NULL));
-                        uint8_t random_row = plugin->playing_random_row;
+                if (msg[1] == 36
+                    and *plugin->play_kick > 0.5
+                    and plugin->frames_since_last_order_kick < plugin->samplerate * (*plugin->kick_spacing / 1000.0)){
+                    ;
+                } else if (msg[1] == 30 and plugin->frames_since_last_random_change > 24000){
+                    /* manage random sequences*/
+                    srand((unsigned) time(NULL));
+                    uint8_t random_row = plugin->playing_random_row;
 
-                        while (random_row == plugin->playing_random_row){
-                            random_row = 2 + (rand() % 5);
-                        }
-
-                        random_change_sample = ev->time.frames;
-                        lo::Address a ("localhost", plugin->port_str());
-                        a.send("/sequence", "sii", "off", 1 + big_sequence * 2,
-                                plugin->playing_random_row);
-                        a.send("/sequence", "sii", "on", 1 + big_sequence * 2,
-                                random_row);
-                        plugin->playing_random_row = random_row;
-                        plugin->frames_since_last_random_change = 0;
-
-                    } else if (plugin->after_long_mute && msg[1]
-                                >= uint16_t(*plugin->demuter_note + 0.5)){
-                        ;
-                    } else {
-                        if (0 == lv2_atom_forge_frame_time (&plugin->forge, m_ev->time.frames)) return;
-                        if (0 == lv2_atom_forge_raw (&plugin->forge, &midiatom, sizeof (LV2_Atom))) return;
-                        if (0 == lv2_atom_forge_raw (&plugin->forge, msg, 3)) return;
-                        lv2_atom_forge_pad (&plugin->forge, sizeof (LV2_Atom) + 3);
+                    while (random_row == plugin->playing_random_row){
+                        random_row = 2 + (rand() % 5);
                     }
 
-                    if (msg[1] == 36){
-                        kick_sample = m_ev->time.frames;
-                        plugin->frames_since_last_kick = 0;
-                    }
+                    random_change_sample = ev->time.frames;
+                    lo::Address a ("localhost", plugin->port_str());
+                    a.send("/sequence", "sii", "off", 1 + big_sequence * 2,
+                            plugin->playing_random_row);
+                    a.send("/sequence", "sii", "on", 1 + big_sequence * 2,
+                            random_row);
+                    plugin->playing_random_row = random_row;
+                    plugin->frames_since_last_random_change = 0;
 
-                    if (plugin->after_long_mute
-                            && (msg[0] & ~0x0F) == 0x90
-                            && msg[1] < uint16_t(*plugin->demuter_note + 0.5)){
-                        plugin->after_long_mute = false;
-                    }
+                } else if (plugin->after_long_mute
+                           && (chan >= uint8_t(*plugin->drum_channel_max + 0.5)
+                               || msg[1] >= uint16_t(*plugin->demuter_note + 0.5))){
+                    ;
+                } else {
+                    if (0 == lv2_atom_forge_frame_time (&plugin->forge, m_ev->time.frames)) return;
+                    if (0 == lv2_atom_forge_raw (&plugin->forge, &midiatom, sizeof (LV2_Atom))) return;
+                    if (0 == lv2_atom_forge_raw (&plugin->forge, msg, 3)) return;
+                    lv2_atom_forge_pad (&plugin->forge, sizeof (LV2_Atom) + 3);
+                }
+
+                if (msg[1] == 36){
+                    kick_sample = m_ev->time.frames;
+                    plugin->frames_since_last_kick = 0;
+                }
+
+                if (plugin->after_long_mute
+                        && command == 0x90
+                        && chan < uint8_t(*plugin->drum_channel_max + 0.5)
+                        && msg[1] < uint16_t(*plugin->demuter_note + 0.5)){
+                    plugin->after_long_mute = false;
                 }
 
             } else if (command != 0x90){

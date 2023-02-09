@@ -1,5 +1,5 @@
 
-NAME = plujain-multip
+NAME = plujain-multipmidi
 
 # installation path
 INSTALL_PATH = /usr/local/lib/lv2
@@ -12,9 +12,6 @@ CXX ?= g++
 CXXFLAGS += -I. -c -ffast-math -fPIC -DPIC -Wall -fvisibility=hidden
 LDFLAGS += -shared -lm 
 
-# libs
-LIBS = -llo -lpthread
-
 # remove command
 RM = rm -f
 
@@ -23,10 +20,10 @@ SRC = $(wildcard src/*.cpp)
 OBJ = $(SRC:.cpp=.o)
 
 # plugin name
-PLUGIN = multip.so
+PLUGIN = multipmidi.so
 
 $(PLUGIN): $(OBJ)
-	$(CXX) $(LDFLAGS) $(OBJ) -o $(PLUGIN) $(LIBS)
+	$(CXX) $(LDFLAGS) $(OBJ) -o $(PLUGIN)
 
 %.o: %.cpp
 	$(CXX) $(CXXFLAGS) -o $@ $<

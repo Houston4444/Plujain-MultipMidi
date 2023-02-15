@@ -1,15 +1,6 @@
-# Pas muting tout de suite ~= 50 ms pour laisser passer le premier temps hors kick
-! passer à la colonne suivante avec autre commande
-velocité gérée
-# attendre snare ou kick après mute long
-server liblo
-# n° port seq192
 
-# option redémarrer cycle au pied
-# Autoriser double kick écrit
-# random passe par une note basse (30?)
-passage de séquence
-
-
- 2on 3on 3off 2off -> multiply
+>Enlever MUTE
+passer en mode 16 canaux
+Ajouter "Temps d'ouverture" (150ms)
+Gérer le MUTE / Auto Demute
   

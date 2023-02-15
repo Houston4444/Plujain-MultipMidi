@@ -19,14 +19,21 @@
 #define MAX(a,b) ( (a) > (b) ? (a) : (b) )
 #define RAIL(v, min, max) (MIN((max), MAX((min), (v))))
 #define ROUND(v) (uint32_t(v + 0.5f))
+#define EVENT_NOTE_ON 0x90
+#define EVENT_NOTE_OFF 0x80
+#define SNARE_GROUP_LEN 6
 
 
 #define PLUGIN_URI "http://plujain/plugins/multipmidi"
 enum {
-    MIDI_IN,
+    SEQ_IN,
+    IMPACT_IN,
+    KICK_IN,
     MIDI_OUT,
     KICK_SPACING,
     MUTE,
+    OPEN_TIME,
+    KS_DEMUTE,
     VELO_1,
     PLUGIN_PORT_COUNT};
 
@@ -87,20 +94,38 @@ public:
     static void cleanup(LV2_Handle instance);
 
     static const void* extension_data(const char* uri);
+
+    void run_it(uint32_t n_samples);
+    bool note_allowed(uint32_t note_mem, uint16_t frame, bool frame_spacing, bool from_impact);
     
-    const LV2_Atom_Sequence *midi_in;
+    const LV2_Atom_Sequence *seq_in;
+    const LV2_Atom_Sequence *impact_in;
+    const LV2_Atom_Sequence *kick_in;
     LV2_Atom_Sequence *midi_out;
     float *kick_spacing;
     float *mute;
+    float *open_time;
+    float *ks_demute;
     float *velocity_1;
     
     double samplerate;
 
-    uint32_t note_on_frame[0xfff];
-    bool note_is_on[0xfff];
-    bool note_comes_from_high[0xfff];
+    bool _kick_on;
+    uint64_t _kick_on_frame;
 
-    uint64_t frame_count;
+    bool _muting;
+
+    uint32_t _note_on_frame[0xfff];
+    bool _note_is_on[0xfff];
+    bool _note_comes_from_impact[0xfff];
+
+    bool _demuted;
+    uint16_t _snare_mute_group[6] = {0x000 | 37, 0x000 | 38, 0x000 | 39,
+                                     0x000 | 40, 0x000 | 41, 0x000 | 42};
+    uint16_t _hihat_mute_group[6] = {0x000 | 44, 0x000 | 45, 0x000 | 46,
+                                     0x000 | 47, 0x000 | 48, 0x000 | 49};
+
+    uint64_t _frame_count;
     /* LV2 Output */
 	LV2_Log_Log* log;
 	LV2_Log_Logger logger;
@@ -161,12 +186,18 @@ LV2_Handle Multipmidi::instantiate(const LV2_Descriptor* descriptor, double samp
 	}
 
     for (uint16_t i=0; i<=0xfff; ++i){
-        plugin->note_is_on[i] = false;
-        plugin->note_comes_from_high[i] = false;
-        plugin->note_on_frame[i] = 0;
+        plugin->_note_is_on[i] = false;
+        plugin->_note_comes_from_impact[i] = false;
+        plugin->_note_on_frame[i] = 0;
     }
 
-    plugin->frame_count = 0;
+    plugin->_kick_on = false;
+    plugin->_kick_on_frame = 0;
+
+    plugin->_muting = false;
+
+    plugin->_frame_count = 0;
+    plugin->_demuted = false;
 
     lv2_atom_forge_init (&plugin->forge, plugin->map);
     map_mem_uris(plugin->map, &plugin->uris);
@@ -198,8 +229,14 @@ void Multipmidi::connect_port(LV2_Handle instance, uint32_t port, void *data)
 
     switch (port)
     {
-        case MIDI_IN:
-            plugin->midi_in = (const LV2_Atom_Sequence*) data;
+        case SEQ_IN:
+            plugin->seq_in = (const LV2_Atom_Sequence*) data;
+            break;
+        case IMPACT_IN:
+            plugin->impact_in = (const LV2_Atom_Sequence*) data;
+            break;
+        case KICK_IN:
+            plugin->kick_in = (const LV2_Atom_Sequence*) data;
             break;
         case MIDI_OUT:
             plugin->midi_out = (LV2_Atom_Sequence*) data;
@@ -209,6 +246,12 @@ void Multipmidi::connect_port(LV2_Handle instance, uint32_t port, void *data)
             break;
         case MUTE:
             plugin->mute = (float*) data;
+            break;
+        case OPEN_TIME:
+            plugin->open_time = (float*) data;
+            break;
+        case KS_DEMUTE:
+            plugin->ks_demute = (float*) data;
             break;
         case VELO_1:
             plugin->velocity_1 = (float*) data;
@@ -223,159 +266,7 @@ void Multipmidi::run(LV2_Handle instance, uint32_t n_samples)
 {
     Multipmidi *plugin;
     plugin = (Multipmidi *) instance;
-    
-    /* set midi_out port for midi messages*/
-    const uint32_t capacity = plugin->midi_out->atom.size;
-    lv2_atom_forge_set_buffer (&plugin->forge, (uint8_t*)plugin->midi_out, capacity);
-    lv2_atom_forge_sequence_head (&plugin->forge, &plugin->frame, 0);
-
-    uint8_t* orig_msg;
-    uint8_t full_command;
-    uint8_t command;
-    uint8_t chan;
-
-    uint32_t frame_spacing = *plugin->kick_spacing * 0.001 * plugin->samplerate;
-    float velo_ratio_1 = *plugin->velocity_1 / 127.0;
-
-    /* process control kick events 
-        note 36 on the last channel */
-    LV2_Atom_Event* ev = lv2_atom_sequence_begin (&(plugin->midi_in)->body);
-    while (!lv2_atom_sequence_is_end (&(plugin->midi_in)->body, (plugin->midi_in)->atom.size, ev)) {
-        if (ev->body.type == plugin->uris.midi_MidiEvent){
-            orig_msg = ((uint8_t*)(ev+1));
-            full_command = orig_msg[0];
-            uint8_t new_chan;
-
-            if ((full_command & 0xF0) == 0xF0){
-                ev = lv2_atom_sequence_next (ev);
-                continue;
-            }
-
-            command = full_command & ~0x0F;
-            chan = full_command & 0x0F;
-            if (chan >= 0x08){
-                new_chan = chan - 0x08;
-            } else {
-                new_chan = chan;
-            }
-
-            if (*plugin->mute > 0.5 && command == 0x90){
-                ev = lv2_atom_sequence_next (ev);
-                continue;
-            }
-
-            uint16_t note_mem = new_chan * 0x100 + orig_msg[1];
-            if (command == 0x90){
-                uint64_t frame_count = plugin->frame_count + ev->time.frames;
-                if (plugin->note_is_on[note_mem]
-                        && frame_count - plugin->note_on_frame[note_mem] <= frame_spacing
-                        && (chan >= 0x08 || plugin->note_comes_from_high[note_mem])){
-                    ev = lv2_atom_sequence_next (ev);
-                    continue;
-                }
-
-                plugin->note_is_on[note_mem] = true;
-                plugin->note_comes_from_high[note_mem] = bool(chan >= 0x08);
-                plugin->note_on_frame[note_mem] = frame_count;
-
-            } else if (command == 0x80){
-                // plugin->note_is_on[note_mem] = false;
-                ;
-            }
-
-            LV2_Atom midiatom;
-            midiatom.type = plugin->uris.midi_MidiEvent;
-            midiatom.size = 3;
-            
-            uint8_t msg[3];
-            msg[0] = command | new_chan; /* Note on or off with channel revert*/
-            msg[1] = orig_msg[1]; /* Note number */
-            if (command == 0x90) msg[2] = orig_msg[2] * velo_ratio_1; /* Velocity */
-            else msg[2] = orig_msg[2];
-
-            if (0 == lv2_atom_forge_frame_time (&plugin->forge, ev->time.frames)) return;
-            if (0 == lv2_atom_forge_raw (&plugin->forge, &midiatom, sizeof (LV2_Atom))) return;
-            if (0 == lv2_atom_forge_raw (&plugin->forge, msg, 3)) return;
-            lv2_atom_forge_pad (&plugin->forge, sizeof (LV2_Atom) + 3);
-
-            // kick_sample = ev->time.frames;
-        }
-        ev = lv2_atom_sequence_next (ev);
-    }
-
-    plugin->frame_count += n_samples;
-    // /* Process all other MIDI messages */
-    // LV2_Atom_Event* m_ev = lv2_atom_sequence_begin (&(plugin->midi_in)->body);
-    // while (!lv2_atom_sequence_is_end (&(plugin->midi_in)->body, (plugin->midi_in)->atom.size, m_ev)) {
-    //     if (m_ev->body.type == plugin->uris.midi_MidiEvent) {
-    //         orig_msg = ((uint8_t*)(m_ev+1));
-    //         full_command = orig_msg[0];
-
-    //         if ((full_command & 0xF0) == 0xF0){
-    //             command = full_command;
-    //             chan = 0;
-    //         } else {
-    //             command = full_command & ~0x0F;
-    //             chan = full_command & 0x0F;
-    //         }
-
-    //         if (chan == 0x0F){
-    //             m_ev = lv2_atom_sequence_next (m_ev);
-    //             continue;
-    //         }
-
-    //         if (command == 0x90
-    //                 and (not plugin->muting
-    //                      or plugin->frames_since_last_order_kick < plugin->pre_mute_frames)){
-    //             LV2_Atom midiatom;
-    //             midiatom.type = plugin->uris.midi_MidiEvent;
-    //             midiatom.size = 3;
-                
-    //             uint8_t msg[3];
-    //             msg[0] = full_command; /* Note on or off with channel*/
-    //             msg[1] = orig_msg[1]; /* Note number */
-    //             msg[2] = orig_msg[2] * plugin->velocity_factor; /* Velocity */
-
-    //             if (msg[1] == 36
-    //                 and *plugin->play_kick > 0.5
-    //                 and plugin->frames_since_last_order_kick < plugin->samplerate * (*plugin->kick_spacing / 1000.0)){
-    //                 ;
-    //             } else if (plugin->after_long_mute
-    //                        && (chan >= uint8_t(*plugin->drum_channel_max + 0.5)
-    //                            || msg[1] >= uint16_t(*plugin->demuter_note + 0.5))){
-    //                 ;
-    //             } else {
-    //                 if (0 == lv2_atom_forge_frame_time (&plugin->forge, m_ev->time.frames)) return;
-    //                 if (0 == lv2_atom_forge_raw (&plugin->forge, &midiatom, sizeof (LV2_Atom))) return;
-    //                 if (0 == lv2_atom_forge_raw (&plugin->forge, msg, 3)) return;
-    //                 lv2_atom_forge_pad (&plugin->forge, sizeof (LV2_Atom) + 3);
-    //             }
-
-    //             if (msg[1] == 36){
-    //                 kick_sample = m_ev->time.frames;
-    //                 plugin->frames_since_last_kick = 0;
-    //             }
-
-    //             if (plugin->after_long_mute
-    //                     && command == 0x90
-    //                     && chan < uint8_t(*plugin->drum_channel_max + 0.5)
-    //                     && msg[1] < uint16_t(*plugin->demuter_note + 0.5)){
-    //                 plugin->after_long_mute = false;
-    //             }
-
-    //         } else if (command != 0x90){
-    //             LV2_Atom midiatom;
-    //             midiatom.type = plugin->uris.midi_MidiEvent;
-    //             midiatom.size = m_ev->body.size;
-
-    //             if (0 == lv2_atom_forge_frame_time (&plugin->forge, m_ev->time.frames)) return;
-    //             if (0 == lv2_atom_forge_raw (&plugin->forge, &midiatom, sizeof (LV2_Atom))) return;
-    //             if (0 == lv2_atom_forge_raw (&plugin->forge, (m_ev+1), 3)) return;
-    //             lv2_atom_forge_pad (&plugin->forge, sizeof (LV2_Atom) + 3);
-    //         }
-    //     }
-    //     m_ev = lv2_atom_sequence_next (m_ev);
-    // }
+    plugin->run_it(n_samples);
 }
 
 /**********************************************************************************************************************************************************/
@@ -390,4 +281,268 @@ void Multipmidi::cleanup(LV2_Handle instance)
 const void* Multipmidi::extension_data(const char* uri)
 {
     return NULL;
+}
+
+bool Multipmidi::note_allowed(uint32_t note_mem, uint16_t frame, bool frame_spacing, bool from_impact){
+    /* check if the note is allowed to be played depending if it comes from
+    impact or seq, and if it has just been played */
+
+    uint64_t frame_count = _frame_count + frame;
+    if (frame_count - _note_on_frame[note_mem] <= frame_spacing
+            && _note_comes_from_impact[note_mem]){
+        // ev = lv2_atom_sequence_next(ev);
+        // continue;
+        return false;
+    }
+
+    bool loop_out = false;
+
+    /* Check SNARE mute group*/
+    for (uint8_t i=0; i<6;++i){
+        if (note_mem == _snare_mute_group[i]){
+            for (uint8_t j=0; j<6;++j){
+                if (frame_count - _note_on_frame[_snare_mute_group[j]] <= frame_spacing
+                        && (from_impact || _note_comes_from_impact[_snare_mute_group[j]])){
+                    // loop_out = true;
+                    // printf("LoopOut Sbnaez\n");
+                    // break;
+                    return false;
+                }
+            }
+            break;
+        }
+    }
+
+    // if (loop_out){
+    //     ev = lv2_atom_sequence_next (ev);
+    //     continue;
+    // }
+
+    /* Check HiHat mute group*/
+    for (uint8_t i=0; i<6;++i){
+        if (note_mem == _hihat_mute_group[i]){
+            for (uint8_t j=0; j<6;++j){
+                if (frame_count - _note_on_frame[_hihat_mute_group[j]] <= frame_spacing
+                        && (from_impact || _note_comes_from_impact[_hihat_mute_group[j]])){
+                    // loop_out = true;
+                    // break;
+                    return false;
+                }
+            }
+            break;
+        }
+    }
+    return true;
+}
+
+void Multipmidi::run_it(uint32_t n_samples){
+    /* set midi_out port for midi messages*/
+    const uint32_t capacity = midi_out->atom.size;
+    lv2_atom_forge_set_buffer (&forge, (uint8_t*)midi_out, capacity);
+    lv2_atom_forge_sequence_head (&forge, &frame, 0);
+
+    uint8_t* orig_msg;
+    uint8_t full_command;
+    uint8_t command;
+    uint8_t chan;
+
+    uint32_t frame_spacing = *kick_spacing * 0.001 * samplerate;
+    uint32_t frame_open_time = *open_time * 0.001 * samplerate;
+    float velo_ratio_1 = *velocity_1 / 127.0;
+
+    LV2_Atom_Event* ev;
+
+    // check if we need to demute the plugin
+    if (! _kick_on && _muting){
+        ev = lv2_atom_sequence_begin (&(seq_in)->body);
+        while (!lv2_atom_sequence_is_end (&(seq_in)->body,
+                                          (seq_in)->atom.size, ev)) {
+            if (ev->body.type == uris.midi_MidiEvent){
+                orig_msg = ((uint8_t*)(ev+1));
+                if ((orig_msg[0] & 0xF0) == EVENT_NOTE_ON
+                        && (orig_msg[0] & 0x0F) <= 1 // channel <= 2nd
+                        && orig_msg[1] < 43){        // note < 43
+                    _demuted = true;
+                    _muting = false;
+                    printf("DEMuted %d %d\n", orig_msg[0], orig_msg[1]);
+                    break;
+                }
+            }
+            ev = lv2_atom_sequence_next (ev);
+        }
+    }
+
+    /* Set plugin->kick_on var true or false witj note on/off */
+    LV2_Atom_Event* kick_ev = lv2_atom_sequence_begin (&(kick_in)->body);
+    while (!lv2_atom_sequence_is_end (&(kick_in)->body,
+                                      (kick_in)->atom.size,
+                                      kick_ev)) {
+        if (kick_ev->body.type == uris.midi_MidiEvent){
+            orig_msg = ((uint8_t*)(kick_ev+1));
+            if ((orig_msg[0] & 0xF0) == 0x90){
+                printf("Un pied %ld\n", _frame_count + kick_ev->time.frames);
+                _kick_on = true;
+                _kick_on_frame = _frame_count + kick_ev->time.frames;
+            } else if ((orig_msg[0] & 0xF0) == 0x80){
+                _kick_on = false;
+                if (*ks_demute < 0.5){
+                    _muting = false;
+                }
+            }
+        }
+        kick_ev = lv2_atom_sequence_next(kick_ev);
+    }
+
+    uint16_t note_mem;
+
+    /* remember note coming from impact */
+    LV2_Atom_Event* imp_ev = lv2_atom_sequence_begin (&(impact_in)->body);
+    while (!lv2_atom_sequence_is_end (&(impact_in)->body,
+                                      (impact_in)->atom.size,
+                                      imp_ev)) {
+        if (imp_ev->body.type == uris.midi_MidiEvent){
+            orig_msg = ((uint8_t*)(imp_ev+1));
+            
+            if ((orig_msg[0] & 0xF0) == 0xF0){
+                /* Ignore system messages */
+                imp_ev = lv2_atom_sequence_next(imp_ev);
+                continue;
+            }
+            
+            chan = orig_msg[0] & 0x0F;
+            note_mem = chan * 0x100 + orig_msg[1];
+
+            if ((orig_msg[0] & 0xF0) == 0x90){
+                _note_is_on[note_mem] = true;
+                _note_on_frame[note_mem] = _frame_count + imp_ev->time.frames;
+                _note_comes_from_impact[note_mem] = true;
+            } else if ((orig_msg[0] & 0xF0) == 0x80){
+                _note_is_on[note_mem] = false;
+            }
+        }
+
+        imp_ev = lv2_atom_sequence_next(imp_ev);
+    }
+
+
+    /* process midi events coming from seq input */
+    ev = lv2_atom_sequence_begin (&(seq_in)->body);
+    while (!lv2_atom_sequence_is_end (&(seq_in)->body, (seq_in)->atom.size, ev)) {
+        if (ev->body.type == uris.midi_MidiEvent){
+            orig_msg = ((uint8_t*)(ev+1));
+            full_command = orig_msg[0];
+
+            if ((full_command & 0xF0) == 0xF0){
+                ev = lv2_atom_sequence_next (ev);
+                continue;
+            }
+
+            command = full_command & ~0x0F;
+            chan = full_command & 0x0F;
+            // if (chan >= 0x08){
+            //     new_chan = chan - 0x08;
+            // } else {
+            //     new_chan = chan;
+            // }
+
+            if (_muting && command == EVENT_NOTE_ON){
+                ev = lv2_atom_sequence_next (ev);
+                continue;
+            }
+
+            // if (*plugin->mute > 0.5 && chan < 0x08
+            //         && command == EVENT_NOTE_ON && ! plugin->demuted){
+            //     ev = lv2_atom_sequence_next (ev);
+            //     continue;
+            // }
+
+            note_mem = chan * 0x100 + orig_msg[1];
+
+            /* Ignore the note under conditions*/
+            if (command == EVENT_NOTE_ON){
+                if (! note_allowed(note_mem, ev->time.frames, frame_spacing, false)){
+                    ev = lv2_atom_sequence_next (ev);
+                    continue;
+                }
+
+                // uint64_t frame_count = frame_count + ev->time.frames;
+                // if (frame_count - _note_on_frame[note_mem] <= frame_spacing
+                //         && _note_comes_from_impact[note_mem]){
+                //     ev = lv2_atom_sequence_next(ev);
+                //     continue;
+                // }
+
+                // bool loop_out = false;
+
+                // /* Check SNARE mute group*/
+                // for (uint8_t i=0; i<6;++i){
+                //     if (note_mem == _snare_mute_group[i]){
+                //         for (uint8_t j=0; j<6;++j){
+                //             if (frame_count - _note_on_frame[_snare_mute_group[j]] <= frame_spacing
+                //                     && (chan >= 0x08 || _note_comes_from_impact[_snare_mute_group[j]])){
+                //                 loop_out = true;
+                //                 printf("LoopOut Sbnaez\n");
+                //                 break;
+                //             }
+                //         }
+                //         break;
+                //     }
+                // }
+
+                // if (loop_out){
+                //     ev = lv2_atom_sequence_next (ev);
+                //     continue;
+                // }
+
+                // /* Check HiHat mute group*/
+                // for (uint8_t i=0; i<6;++i){
+                //     if (note_mem == _hihat_mute_group[i]){
+                //         for (uint8_t j=0; j<6;++j){
+                //             if (frame_count - _note_on_frame[_hihat_mute_group[j]] <= frame_spacing
+                //                     && (chan >= 0x08 || _note_comes_from_impact[_hihat_mute_group[j]])){
+                //                 loop_out = true;
+                //                 break;
+                //             }
+                //         }
+                //         break;
+                //     }
+                // }
+
+                // if (loop_out){
+                //     ev = lv2_atom_sequence_next (ev);
+                //     continue;
+                // }
+
+                /* Store the note*/
+                _note_is_on[note_mem] = true;
+                _note_comes_from_impact[note_mem] = false;
+                _note_on_frame[note_mem] = _frame_count + ev->time.frames;
+
+            } else if (command == 0x80){
+                _note_is_on[note_mem] = false;
+            }
+
+            LV2_Atom midiatom;
+            midiatom.type = uris.midi_MidiEvent;
+            midiatom.size = 3;
+            
+            uint8_t msg[3];
+            msg[0] = full_command;
+            msg[1] = orig_msg[1]; /* Note number */
+            if (command == 0x90) msg[2] = orig_msg[2] * velo_ratio_1; /* Velocity */
+            else msg[2] = orig_msg[2];
+
+            if (0 == lv2_atom_forge_frame_time (&forge, ev->time.frames)) return;
+            if (0 == lv2_atom_forge_raw (&forge, &midiatom, sizeof (LV2_Atom))) return;
+            if (0 == lv2_atom_forge_raw (&forge, msg, 3)) return;
+            lv2_atom_forge_pad (&forge, sizeof (LV2_Atom) + 3);
+        }
+        ev = lv2_atom_sequence_next (ev);
+    }
+
+    _frame_count += n_samples;
+
+    if (_kick_on && _frame_count - _kick_on_frame >= frame_open_time){
+        _muting = true;
+    }
 }

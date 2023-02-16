@@ -96,7 +96,7 @@ public:
     static const void* extension_data(const char* uri);
 
     void run_it(uint32_t n_samples);
-    bool note_allowed(uint32_t note_mem, uint16_t frame, bool frame_spacing, bool from_impact);
+    bool note_allowed(uint16_t note_mem, uint32_t frame, uint32_t frame_spacing, bool from_impact);
     
     const LV2_Atom_Sequence *seq_in;
     const LV2_Atom_Sequence *impact_in;
@@ -283,19 +283,18 @@ const void* Multipmidi::extension_data(const char* uri)
     return NULL;
 }
 
-bool Multipmidi::note_allowed(uint32_t note_mem, uint16_t frame, bool frame_spacing, bool from_impact){
+bool Multipmidi::note_allowed(
+        uint16_t note_mem, uint32_t frame, uint32_t frame_spacing, bool from_impact){
     /* check if the note is allowed to be played depending if it comes from
-    impact or seq, and if it has just been played */
+    impact or seq, and if it has just been played, or if a note in the same mute group
+    (snare, hihat) has just been played */
 
     uint64_t frame_count = _frame_count + frame;
+
     if (frame_count - _note_on_frame[note_mem] <= frame_spacing
             && _note_comes_from_impact[note_mem]){
-        // ev = lv2_atom_sequence_next(ev);
-        // continue;
         return false;
     }
-
-    bool loop_out = false;
 
     /* Check SNARE mute group*/
     for (uint8_t i=0; i<6;++i){
@@ -303,9 +302,6 @@ bool Multipmidi::note_allowed(uint32_t note_mem, uint16_t frame, bool frame_spac
             for (uint8_t j=0; j<6;++j){
                 if (frame_count - _note_on_frame[_snare_mute_group[j]] <= frame_spacing
                         && (from_impact || _note_comes_from_impact[_snare_mute_group[j]])){
-                    // loop_out = true;
-                    // printf("LoopOut Sbnaez\n");
-                    // break;
                     return false;
                 }
             }
@@ -313,19 +309,12 @@ bool Multipmidi::note_allowed(uint32_t note_mem, uint16_t frame, bool frame_spac
         }
     }
 
-    // if (loop_out){
-    //     ev = lv2_atom_sequence_next (ev);
-    //     continue;
-    // }
-
     /* Check HiHat mute group*/
     for (uint8_t i=0; i<6;++i){
         if (note_mem == _hihat_mute_group[i]){
             for (uint8_t j=0; j<6;++j){
                 if (frame_count - _note_on_frame[_hihat_mute_group[j]] <= frame_spacing
                         && (from_impact || _note_comes_from_impact[_hihat_mute_group[j]])){
-                    // loop_out = true;
-                    // break;
                     return false;
                 }
             }
@@ -364,7 +353,6 @@ void Multipmidi::run_it(uint32_t n_samples){
                         && orig_msg[1] < 43){        // note < 43
                     _demuted = true;
                     _muting = false;
-                    printf("DEMuted %d %d\n", orig_msg[0], orig_msg[1]);
                     break;
                 }
             }
@@ -372,7 +360,7 @@ void Multipmidi::run_it(uint32_t n_samples){
         }
     }
 
-    /* Set plugin->kick_on var true or false witj note on/off */
+    /* Set kick_on var true or false with note on/off */
     LV2_Atom_Event* kick_ev = lv2_atom_sequence_begin (&(kick_in)->body);
     while (!lv2_atom_sequence_is_end (&(kick_in)->body,
                                       (kick_in)->atom.size,
@@ -380,9 +368,9 @@ void Multipmidi::run_it(uint32_t n_samples){
         if (kick_ev->body.type == uris.midi_MidiEvent){
             orig_msg = ((uint8_t*)(kick_ev+1));
             if ((orig_msg[0] & 0xF0) == 0x90){
-                printf("Un pied %ld\n", _frame_count + kick_ev->time.frames);
                 _kick_on = true;
                 _kick_on_frame = _frame_count + kick_ev->time.frames;
+                _muting = false;
             } else if ((orig_msg[0] & 0xF0) == 0x80){
                 _kick_on = false;
                 if (*ks_demute < 0.5){
@@ -408,22 +396,42 @@ void Multipmidi::run_it(uint32_t n_samples){
                 imp_ev = lv2_atom_sequence_next(imp_ev);
                 continue;
             }
-            
+
             chan = orig_msg[0] & 0x0F;
             note_mem = chan * 0x100 + orig_msg[1];
 
             if ((orig_msg[0] & 0xF0) == 0x90){
+                if (! note_allowed(note_mem, 0, frame_spacing, true)){
+                    imp_ev = lv2_atom_sequence_next(imp_ev);
+                    continue;
+                }
                 _note_is_on[note_mem] = true;
                 _note_on_frame[note_mem] = _frame_count + imp_ev->time.frames;
                 _note_comes_from_impact[note_mem] = true;
             } else if ((orig_msg[0] & 0xF0) == 0x80){
                 _note_is_on[note_mem] = false;
             }
-        }
 
+            LV2_Atom midiatom;
+            midiatom.type = uris.midi_MidiEvent;
+            midiatom.size = 3;
+            
+            uint8_t msg[3];
+            msg[0] = orig_msg[0];
+            msg[1] = orig_msg[1]; /* Note number */
+            if ((orig_msg[0] & 0xF0) == 0x90) msg[2] = orig_msg[2] * velo_ratio_1; /* Velocity */
+            else msg[2] = orig_msg[2];
+
+            /* Because midi messages must be written in frames order,
+               and because this is a live plugin, choose is to send this impact on frame 0.*/
+            if (0 == lv2_atom_forge_frame_time (&forge, 0)) return;
+            // if (0 == lv2_atom_forge_frame_time (&forge, imp_ev->time.frames)) return;
+            if (0 == lv2_atom_forge_raw (&forge, &midiatom, sizeof (LV2_Atom))) return;
+            if (0 == lv2_atom_forge_raw (&forge, msg, 3)) return;
+            lv2_atom_forge_pad (&forge, sizeof (LV2_Atom) + 3);
+        }
         imp_ev = lv2_atom_sequence_next(imp_ev);
     }
-
 
     /* process midi events coming from seq input */
     ev = lv2_atom_sequence_begin (&(seq_in)->body);
@@ -439,22 +447,11 @@ void Multipmidi::run_it(uint32_t n_samples){
 
             command = full_command & ~0x0F;
             chan = full_command & 0x0F;
-            // if (chan >= 0x08){
-            //     new_chan = chan - 0x08;
-            // } else {
-            //     new_chan = chan;
-            // }
 
             if (_muting && command == EVENT_NOTE_ON){
                 ev = lv2_atom_sequence_next (ev);
                 continue;
             }
-
-            // if (*plugin->mute > 0.5 && chan < 0x08
-            //         && command == EVENT_NOTE_ON && ! plugin->demuted){
-            //     ev = lv2_atom_sequence_next (ev);
-            //     continue;
-            // }
 
             note_mem = chan * 0x100 + orig_msg[1];
 
@@ -464,54 +461,6 @@ void Multipmidi::run_it(uint32_t n_samples){
                     ev = lv2_atom_sequence_next (ev);
                     continue;
                 }
-
-                // uint64_t frame_count = frame_count + ev->time.frames;
-                // if (frame_count - _note_on_frame[note_mem] <= frame_spacing
-                //         && _note_comes_from_impact[note_mem]){
-                //     ev = lv2_atom_sequence_next(ev);
-                //     continue;
-                // }
-
-                // bool loop_out = false;
-
-                // /* Check SNARE mute group*/
-                // for (uint8_t i=0; i<6;++i){
-                //     if (note_mem == _snare_mute_group[i]){
-                //         for (uint8_t j=0; j<6;++j){
-                //             if (frame_count - _note_on_frame[_snare_mute_group[j]] <= frame_spacing
-                //                     && (chan >= 0x08 || _note_comes_from_impact[_snare_mute_group[j]])){
-                //                 loop_out = true;
-                //                 printf("LoopOut Sbnaez\n");
-                //                 break;
-                //             }
-                //         }
-                //         break;
-                //     }
-                // }
-
-                // if (loop_out){
-                //     ev = lv2_atom_sequence_next (ev);
-                //     continue;
-                // }
-
-                // /* Check HiHat mute group*/
-                // for (uint8_t i=0; i<6;++i){
-                //     if (note_mem == _hihat_mute_group[i]){
-                //         for (uint8_t j=0; j<6;++j){
-                //             if (frame_count - _note_on_frame[_hihat_mute_group[j]] <= frame_spacing
-                //                     && (chan >= 0x08 || _note_comes_from_impact[_hihat_mute_group[j]])){
-                //                 loop_out = true;
-                //                 break;
-                //             }
-                //         }
-                //         break;
-                //     }
-                // }
-
-                // if (loop_out){
-                //     ev = lv2_atom_sequence_next (ev);
-                //     continue;
-                // }
 
                 /* Store the note*/
                 _note_is_on[note_mem] = true;

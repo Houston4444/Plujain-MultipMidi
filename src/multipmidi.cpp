@@ -33,6 +33,8 @@ enum {
     KICK_SPACING,
     OPEN_TIME,
     KS_DEMUTE,
+    KICK_VELO_RATIO,
+    VELOCITY,
     PLUGIN_PORT_COUNT};
 
 
@@ -107,12 +109,14 @@ public:
     float *kick_spacing;
     float *open_time;
     float *ks_demute;
+    float *kick_velo_ratio;
+    float *velocity;
 
     double samplerate;
 
     uint8_t _kick_status;
     uint64_t _kick_on_frame;
-    float _velo_ratio;
+    uint8_t _last_kick_velo;
 
     uint32_t _note_on_frame[0xfff];
     bool _note_is_on[0xfff];
@@ -195,7 +199,7 @@ LV2_Handle Multipmidi::instantiate(const LV2_Descriptor* descriptor, double samp
     plugin->_kick_on_frame = 0;
 
     plugin->_frame_count = 0;
-    plugin->_velo_ratio = 1.0f;
+    plugin->_last_kick_velo = 100;
 
     lv2_atom_forge_init (&plugin->forge, plugin->map);
     map_mem_uris(plugin->map, &plugin->uris);
@@ -247,6 +251,12 @@ void Multipmidi::connect_port(LV2_Handle instance, uint32_t port, void *data)
             break;
         case KS_DEMUTE:
             plugin->ks_demute = (float*) data;
+            break;
+        case KICK_VELO_RATIO:
+            plugin->kick_velo_ratio = (float*) data;
+            break;
+        case VELOCITY:
+            plugin->velocity = (float*) data;
             break;
     }
         
@@ -357,11 +367,11 @@ void Multipmidi::run_it(uint32_t n_samples){
                                       kick_ev)) {
         if (kick_ev->body.type == uris.midi_MidiEvent){
             orig_msg = ((uint8_t*)(kick_ev+1));
-            if ((orig_msg[0] & 0xF0) == 0x90){
+            if ((orig_msg[0] & 0xF0) == EVENT_NOTE_ON){
                 _kick_status = KICK_ON_OPEN;
                 _kick_on_frame = _frame_count + kick_ev->time.frames;
-                _velo_ratio = orig_msg[2] / 127.0;
-            } else if ((orig_msg[0] & 0xF0) == 0x80){
+                _last_kick_velo = orig_msg[2];
+            } else if ((orig_msg[0] & 0xF0) == EVENT_NOTE_OFF){
                 if (*ks_demute > 0.5 && _kick_status == KICK_ON_MUTE)
                     _kick_status = KICK_OFF_MUTE;
                 else _kick_status = KICK_OFF;
@@ -389,7 +399,7 @@ void Multipmidi::run_it(uint32_t n_samples){
             chan = orig_msg[0] & 0x0F;
             note_mem = chan * 0x100 + orig_msg[1];
 
-            if ((orig_msg[0] & 0xF0) == 0x90){
+            if ((orig_msg[0] & 0xF0) == EVENT_NOTE_ON){
                 if (! note_allowed(note_mem, 0, frame_spacing, true)){
                     imp_ev = lv2_atom_sequence_next(imp_ev);
                     continue;
@@ -397,7 +407,7 @@ void Multipmidi::run_it(uint32_t n_samples){
                 _note_is_on[note_mem] = true;
                 _note_on_frame[note_mem] = _frame_count;
                 _note_comes_from_impact[note_mem] = true;
-            } else if ((orig_msg[0] & 0xF0) == 0x80){
+            } else if ((orig_msg[0] & 0xF0) == EVENT_NOTE_OFF){
                 _note_is_on[note_mem] = false;
             }
 
@@ -408,9 +418,15 @@ void Multipmidi::run_it(uint32_t n_samples){
             uint8_t msg[3];
             msg[0] = orig_msg[0];
             msg[1] = orig_msg[1]; /* Note number */
-            if ((orig_msg[0] & 0xF0) == 0x90) msg[2] = orig_msg[2] * _velo_ratio; /* Velocity */
-            else msg[2] = orig_msg[2];
 
+            if ((orig_msg[0] & 0xF0) == EVENT_NOTE_ON){
+                /* Velocity */
+                msg[2] = MIN(orig_msg[2] * *kick_velo_ratio * 0.0001 * _last_kick_velo
+                             + orig_msg[2] * *velocity * 0.0001 * (100.0 - *kick_velo_ratio),
+                             127);
+            } else {
+                msg[2] = orig_msg[2];
+            }
             /* Because midi messages must be written in frames order,
                and because this is a live plugin, choose is to send this impact on frame 0.*/
             if (0 == lv2_atom_forge_frame_time (&forge, 0)) return;
@@ -456,7 +472,7 @@ void Multipmidi::run_it(uint32_t n_samples){
                 _note_comes_from_impact[note_mem] = false;
                 _note_on_frame[note_mem] = _frame_count + ev->time.frames;
 
-            } else if (command == 0x80){
+            } else if (command == EVENT_NOTE_OFF){
                 _note_is_on[note_mem] = false;
             }
 
@@ -467,8 +483,15 @@ void Multipmidi::run_it(uint32_t n_samples){
             uint8_t msg[3];
             msg[0] = full_command;
             msg[1] = orig_msg[1]; /* Note number */
-            if (command == 0x90) msg[2] = orig_msg[2] * _velo_ratio; /* Velocity */
-            else msg[2] = orig_msg[2];
+
+            if ((orig_msg[0] & 0xF0) == EVENT_NOTE_ON){
+                /* Velocity */
+                msg[2] = MIN(orig_msg[2] * *kick_velo_ratio * 0.0001 * _last_kick_velo
+                             + orig_msg[2] * *velocity * 0.0001 * (100.0 - *kick_velo_ratio),
+                             127);
+            } else {
+                msg[2] = orig_msg[2];
+            }
 
             if (0 == lv2_atom_forge_frame_time (&forge, ev->time.frames)) return;
             if (0 == lv2_atom_forge_raw (&forge, &midiatom, sizeof (LV2_Atom))) return;
@@ -494,7 +517,7 @@ void Multipmidi::run_it(uint32_t n_samples){
                     midiatom.size = 3;
 
                     uint8_t msg[3];
-                    msg[0] = 0x80 | chan;
+                    msg[0] = EVENT_NOTE_OFF | chan;
                     msg[1] = note;
                     msg[2] = 100;
 
